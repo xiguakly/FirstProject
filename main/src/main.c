@@ -1,350 +1,281 @@
+/*==================================笔记===================== 
+1.LVGL使用方式
+    1.1在所有与lvgl屏幕的相关代码开始之前，需要lv_init();
+    1.2当所有配置初始化完成后，创建一块空画布，可在这个画布上添加控件，这块画布就是父容器
+        1.2.1:定义控件指针 lv_obj_t *NewScr
+        1.2.2:创建新画布 NewScr = lv_obj_create(NULL)，参数一定为NULL，NULL代表创建新的空画布
+                lv_obj_create(lv_src_act())，参数为lv_src_act()，这代表默认屏幕，不用创建就存在的初始画布，是所有控件
+                    的父容器。
+        1.2.3:设置显示效果：lv_obj_set_style_bg_color(屏幕指针，颜色，传参3)
+        1.2.4：屏幕对齐：这一步没有，自动铺满整个屏幕
+        1.2.5：在这个屏幕内创建控件。
+    注：跳转不同屏幕函数：lv_scr_load(屏幕指针)
+2.创建控件步骤：
+    2.1:定义控件指针 lv_obj_t *xxx
+    2.2:调用对应创建API： lv_xxx_create(父容器)
+        父容器：    1.当前屏幕 = lv_scr_act()
+                    2.别的控件 = lv_obj_t *xxx里的xxx
+                    3.null = 独立新屏幕
+    2.3：设置显示效果：调用不同API设置长宽高，颜色，等各种显示效果
+    2.4：设置位置对齐：对应在父容器的什么位置lv_obj_align(控件，父对象，对齐模数，x偏移，y偏移)
+    2.5：配置专属功能：不同控件有不同的功能，调用不同API设置专属功能
+=========================================================*/
+
+
+// 解决MinGW下SDL、标准库函数隐式声明警告
+#define _DEFAULT_SOURCE
+
+// C标准库，LVGL内存分配、工具函数依赖
+#include <stdlib.h>
+// SDL2库：实现窗口、渲染、时钟、关闭事件，模拟LCD屏幕硬件
+#include <SDL2/SDL.h>
+// LVGL总头文件，包含全部控件、驱动、样式、系统API
+#include "lvgl/lvgl.h"
+// 官方示例控件，暂时不用注释关闭
+//#include "lvgl/examples/lv_examples.h"
+
+// 屏幕分辨率宏：宽800像素，高480像素
+#define W 800
+#define H 480
+
+// 全局LVGL单帧显存缓存：存储一整屏像素数据，static全局常驻内存
+static lv_color_t frame_buf1[W * H];
+static lv_color_t frame_buf2[W * H];
+//鼠标输入相关变量
+static int16_t mouse_x = 0;       
+static int16_t mouse_y = 0;
+static bool mouse_down = false;
+
+// SDL渲染全局对象，回调函数flush_cb需要直接访问，设为static全局
+static SDL_Window* win = NULL;        // 电脑仿真窗口句柄
+static SDL_Renderer* ren = NULL;      // SDL软件渲染器
+static SDL_Texture* tex = NULL;       // 像素纹理，对接LVGL显存
+static lv_obj_t* label=NULL;           //标签名称
+
+//变量
+static bool APP_Running = true;
+//======================================自定义函数声明===========================================//
+static void mouse_drv_init(void);
+static Uint32 get_mouse_state(SDL_Event *e);
+static void mouse_read_cb(lv_indev_drv_t *indev_drv,
+                        lv_indev_data_t *data);
+static void btn_click_event(lv_event_t *e);
+//======================================自定义函数声明===========================================//
 
 /**
- * @file main
- *
+ * @brief LVGL屏幕刷新回调函数（底层驱动核心）
+ * LVGL完成画面绘制后自动调用，把内存缓存图像推送到SDL窗口
+ * @param drv 显示驱动实例句柄
+ * @param area 本次刷新区域（局部刷新使用，本工程全屏刷新未用到）
+ * @param buf LVGL绘制完成的像素缓存数组
  */
-
-/*********************
- *      INCLUDES
- *********************/
-#define _DEFAULT_SOURCE /* needed for usleep() */
-#include <stdlib.h>
-#include <unistd.h>
-#include <pthread.h>
-#include "lv_drv_conf.h"
-#include "lvgl/lvgl.h"
-#include "lvgl/examples/lv_examples.h"
-#include "lvgl/demos/lv_demos.h"
-#if USE_SDL
-  #define SDL_MAIN_HANDLED /*To fix SDL's "undefined reference to WinMain" issue*/
-  #include <SDL2/SDL.h>
-  #include "lv_drivers/sdl/sdl.h"
-#elif USE_X11
-  #include "lv_drivers/x11/x11.h"
-#endif
-// #include "lv_drivers/display/monitor.h"
-// #include "lv_drivers/indev/mouse.h"
-// #include "lv_drivers/indev/keyboard.h"
-// #include "lv_drivers/indev/mousewheel.h"
-
-/*********************
- *      DEFINES
- *********************/
-
-/**********************
- *      TYPEDEFS
- **********************/
-
-/**********************
- *  STATIC PROTOTYPES
- **********************/
-static void hal_init(void);
-static void hal_deinit(void);
-static void* tick_thread(void *data);
-
-/**********************
- *  STATIC VARIABLES
- **********************/
-static pthread_t thr_tick;    /* thread */
-static bool end_tick = false; /* flag to terminate thread */
-
-/**********************
- *      MACROS
- **********************/
-
-/**********************
- *   GLOBAL FUNCTIONS
- **********************/
-
-/*********************
- *      DEFINES
- *********************/
-
-/**********************
- *      TYPEDEFS
- **********************/
-
-/**********************
- *      VARIABLES
- **********************/
-
-/**********************
- *  STATIC PROTOTYPES
- **********************/
-
-/**********************
- *   GLOBAL FUNCTIONS
- **********************/
-#if 0
-static void user_image_demo()
+static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *buf)
 {
-  lv_obj_t * img = lv_gif_create(lv_scr_act());
-  lv_gif_set_src(img, "A:lvgl/examples/libs/gif/bulb.gif");
-  lv_obj_align(img, LV_ALIGN_BOTTOM_RIGHT, -20, -20);
-
-  lv_color_t bg_color = lv_palette_lighten(LV_PALETTE_LIGHT_BLUE, 5);
-    lv_color_t fg_color = lv_palette_darken(LV_PALETTE_BLUE, 4);
-
-    lv_obj_t * qr = lv_qrcode_create(lv_scr_act(), 150, fg_color, bg_color);
-
-    /*Set data*/
-    const char * data = "https://lvgl.io";
-    lv_qrcode_update(qr, data, strlen(data));
-    lv_obj_center(qr);
-
-    /*Add a border with bg_color*/
-    lv_obj_set_style_border_color(qr, bg_color, 0);
-    lv_obj_set_style_border_width(qr, 5, 0);
-
-    /*Create a font*/
-    static lv_ft_info_t info;
-    /*FreeType uses C standard file system, so no driver letter is required.*/
-    info.name = "./lvgl/examples/libs/freetype/Lato-Regular.ttf";
-    info.weight = 24;
-    info.style = FT_FONT_STYLE_NORMAL;
-    info.mem = NULL;
-    if(!lv_ft_font_init(&info)) {
-        LV_LOG_ERROR("create failed.");
-    }
-
-    /*Create style with the new font*/
-    static lv_style_t style;
-    lv_style_init(&style);
-    lv_style_set_text_font(&style, info.font);
-    lv_style_set_text_align(&style, LV_TEXT_ALIGN_CENTER);
-
-    /*Create a label with the new style*/
-    lv_obj_t * label = lv_label_create(lv_scr_act());
-    lv_obj_add_style(label, &style, 0);
-    lv_label_set_text(label, "Hello world\nI'm a font created with FreeType");
-    lv_obj_set_pos(label, 10, 10);
-
-    lv_obj_t *  img1 = lv_img_create(lv_scr_act());
-    /* Assuming a File system is attached to letter 'A'
-     * E.g. set LV_USE_FS_STDIO 'A' in lv_conf.h */
-    lv_img_set_src(img1, "A:lvgl/examples/libs/png/wink.png");
-    lv_obj_align(img1, LV_ALIGN_LEFT_MID, 20, 0);
-
-    lv_obj_t * wp;
-
-    wp = lv_img_create(lv_scr_act());
-    /* Assuming a File system is attached to letter 'A'
-     * E.g. set LV_USE_FS_STDIO 'A' in lv_conf.h */
-    lv_img_set_src(wp, "A:lvgl/examples/libs/sjpg/small_image.sjpg");
-    lv_obj_align(wp, LV_ALIGN_RIGHT_MID, -20, 0);
-
-    lv_obj_t * img2 = lv_img_create(lv_scr_act());
-    /* Assuming a File system is attached to letter 'A'
-     * E.g. set LV_USE_FS_STDIO 'A' in lv_conf.h */
-    lv_img_set_src(img2, "A:lvgl/examples/libs/sjpg/lv_example_jpg.jpg");
-    //lv_obj_center(img);
-    lv_obj_align(img2, LV_ALIGN_TOP_RIGHT, -20, 20);
-
-    lv_obj_t * img3 = lv_img_create(lv_scr_act());
-    /* Assuming a File system is attached to letter 'A'
-     * E.g. set LV_USE_FS_STDIO 'A' in lv_conf.h */
-#if LV_COLOR_DEPTH == 32
-    lv_img_set_src(img3, "A:lvgl/examples/libs/bmp/example_32bit.bmp");
-#elif LV_COLOR_DEPTH == 16
-    lv_img_set_src(img, "A:lvgl/examples/libs/bmp/example_16bit.bmp");
-#endif
-    lv_obj_align(img3, LV_ALIGN_BOTTOM_MID, 0, -20);
-
-    lv_obj_t * img4 = lv_img_create(lv_scr_act());
-    lv_img_set_src(img4, "A:lvgl/examples/libs/ffmpeg/ffmpeg.png");
-    lv_obj_align(img4, LV_ALIGN_BOTTOM_LEFT, 20, -20);
-
-    lv_obj_t * player = lv_ffmpeg_player_create(lv_scr_act());
-    lv_ffmpeg_player_set_src(player, "./lvgl/examples/libs/ffmpeg/birds.mp4");
-    lv_ffmpeg_player_set_auto_restart(player, true);
-    lv_ffmpeg_player_set_cmd(player, LV_FFMPEG_PLAYER_CMD_START);
-    lv_obj_align(player, LV_ALIGN_TOP_MID, 0, 20);
+    /* ren即SDL渲染器的句柄 */
+    //设置渲染器的清屏底色
+    SDL_SetRenderDrawColor(ren,0x88,0x88,0x88,255);
+    //清屏
+    SDL_RenderClear(ren);
+    // 将LVGL像素数据更新到SDL纹理，NULL代表更新整张屏幕
+    SDL_UpdateTexture(tex, NULL, buf, W * sizeof(lv_color_t));
+    // 将纹理送入渲染队列缓存
+    SDL_RenderCopy(ren, tex, NULL, NULL);
+    // 把缓存画面真正渲染到窗口界面
+    SDL_RenderPresent(ren);
+    // 关键：通知LVGL屏幕刷新完成，允许下一帧绘制，不加会界面卡死
+    lv_disp_flush_ready(drv);
 }
-#endif
+
+/**
+ * @brief 硬件抽象层初始化（HAL层）
+ * 模拟单片机LCD初始化，完成SDL窗口创建 + LVGL显示驱动注册
+ * 属于底层固定代码，界面业务修改无需改动此处
+ */
+static void simple_hal_init(void)
+{
+    // 初始化SDL视频子系统，仅启用窗口绘图功能
+    SDL_Init(SDL_INIT_VIDEO);
+    // 创建SDL窗口：标题、居中位置、宽高、无特殊属性
+    win = SDL_CreateWindow("TFT Simulator", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H, 0);
+    // 创建软件渲染器，兼容所有显卡，纯CPU绘图
+    ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
+    // 创建流式纹理，像素格式RGB565和LVGL匹配，支持实时更新像素
+    tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_STATIC, W, H);
+
+    // LVGL绘制缓存结构体
+    static lv_disp_draw_buf_t disp_buf;
+    // 初始化绘图缓存：主缓存frame_buf，无副缓存（单缓冲），总像素数量W*H
+    lv_disp_draw_buf_init(&disp_buf, frame_buf1, frame_buf2, W * H);
+
+    // LVGL屏幕驱动配置结构体
+    static lv_disp_drv_t disp_drv;
+    // 填充驱动默认参数
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.draw_buf = &disp_buf;      // 绑定绘图内存缓存
+    disp_drv.flush_cb = flush_cb;       // 绑定屏幕刷新回调
+    disp_drv.hor_res = W;               // 屏幕横向分辨率
+    disp_drv.ver_res = H;               // 屏幕纵向分辨率
+    disp_drv.full_refresh = true;
+    lv_disp_drv_register(&disp_drv);    // 向LVGL注册屏幕驱动，使LVGL识别显示屏
+
+    // 设置主屏幕背景灰色，区分前景文字控件
+    // lv_scr_act()：获取当前激活的顶层屏幕（所有控件的父容器）
+    // 0：样式作用于控件默认普通状态
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x888888), 0);
+    //鼠标驱动初始化
+    mouse_drv_init();
+}
 
 int main(int argc, char **argv)
 {
-  (void)argc; /*Unused*/
-  (void)argv; /*Unused*/
+    // 屏蔽命令行参数未使用警告
+    (void)argc;
+    (void)argv;
 
-  /*Initialize LVGL*/
-  lv_init();
+    // 1. LVGL库内核初始化，程序最优先执行
+    lv_init();
+    // 2. 初始化SDL仿真屏幕底层驱动
+    simple_hal_init();
+    //创建新屏幕
+    //lv_obj_create(NULL);    
+    // ==================== UI业务界面代码 ====================
+    // 创建文字标签，父容器为主屏幕
+    label = lv_label_create(lv_scr_act());
+    // 设置标签显示文本
+    lv_label_set_text(label, "LVGL Test Text OK");
+    // 把控件在父容器居中
+    lv_obj_center(label);
+    // 设置文字颜色为黑色
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);
 
-  /*Initialize the HAL (display, input devices, tick) for LVGL*/
-  hal_init();
+    // 创建按钮控件，父容器为主屏幕
+    lv_obj_t *test_btn = lv_btn_create(lv_scr_act());
+    // 设置按钮尺寸：宽140px，高60px
+    lv_obj_set_size(test_btn,140,60);
+    // 对齐：父容器底部居中，X偏移0，向上偏移15像素
+    lv_obj_align(test_btn,LV_ALIGN_BOTTOM_MID,0,-15);
 
-//  lv_example_switch_1();
-//  lv_example_calendar_1();
-//  lv_example_btnmatrix_2();
-//  lv_example_checkbox_1();
-//  lv_example_colorwheel_1();
-//  lv_example_chart_6();
-//  lv_example_table_2();
-//  lv_example_scroll_2();
-//  lv_example_textarea_1();
-//  lv_example_msgbox_1();
-//  lv_example_dropdown_2();
-//  lv_example_btn_1();
-//  lv_example_scroll_1();
-//  lv_example_tabview_1();
-//  lv_example_tabview_1();
-//  lv_example_flex_3();
-//  lv_example_label_1();
+    // 【修复原代码错误】按钮内部创建文字标签，父容器是按钮test_btn
+    lv_obj_t *btn_text = lv_label_create(test_btn);
+    // 标签专属接口设置文字
+    lv_label_set_text(btn_text,"button1");
+    // 文字在按钮内部居中
+    lv_obj_center(btn_text);
+    // 按钮文字设置为白色
+    lv_obj_set_style_text_color(btn_text,lv_color_white(),0);
+    //给按钮绑定点击事件
+    //参数1：按钮名称，参数2：回调函数,参数3：监听事件，参数4：自定义参数
+    lv_obj_add_event_cb(test_btn, btn_click_event , LV_EVENT_CLICKED , NULL);
 
-  lv_demo_widgets();
-//  lv_demo_keypad_encoder();
-//  lv_demo_benchmark();
-//  lv_demo_stress();
-//  lv_demo_music();
+    // 强制立刻刷新一帧，程序启动直接渲染界面，无需等待循环调度
+    //lv_refr_now(NULL);
 
-//  user_image_demo();
+    // ==================== 主循环变量定义 ====================
+    SDL_Event e;
+    // 记录上一次给LVGL提供心跳的时间戳
+    uint32_t tick = SDL_GetTicks(); 
 
-  while(1) {
-    /* Periodically call the lv_task handler.
-     * It could be done in a timer interrupt or an OS task too.*/
-    lv_timer_handler();
-    usleep(5 * 1000);
-  }
-
-  hal_deinit();
-  return 0;
+    // ==================== 嵌入式标准死循环 ====================
+    while(APP_Running)
+    {
+        // 轮询SDL所有窗口事件：关闭窗口、鼠标点击、移动
+        get_mouse_state(&e);
+        uint32_t now = SDL_GetTicks();
+        // 每5ms给LVGL送入一次计时节拍，驱动动画、长按、定时器
+        if(now - tick >= 15){
+            lv_tick_inc(15);
+            tick = now;
+        }
+        // LVGL核心调度函数：刷新界面、执行动画、检测交互、调用flush_cb
+        lv_timer_handler();
+        // 短暂延时，降低CPU占用，不影响画面流畅度
+        SDL_Delay(2); 
+    } 
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    return 0;
 }
 
-/**********************
- *   STATIC FUNCTIONS
- **********************/
 
-/**
- * Initialize the Hardware Abstraction Layer (HAL) for the LVGL graphics
- * library
- */
-static void hal_init(void)
+//======================================自定义函数===========================================//
+//鼠标驱动初始化
+static void mouse_drv_init(void)
 {
-  /* mouse input device */
-  static lv_indev_drv_t indev_drv_1;
-  lv_indev_drv_init(&indev_drv_1);
-  indev_drv_1.type = LV_INDEV_TYPE_POINTER;
-
-  /* keyboard input device */
-  static lv_indev_drv_t indev_drv_2;
-  lv_indev_drv_init(&indev_drv_2);
-  indev_drv_2.type = LV_INDEV_TYPE_KEYPAD;
-
-  /* mouse scroll wheel input device */
-  static lv_indev_drv_t indev_drv_3;
-  lv_indev_drv_init(&indev_drv_3);
-  indev_drv_3.type = LV_INDEV_TYPE_ENCODER;
-
-  lv_group_t *g = lv_group_create();
-  lv_group_set_default(g);
-
-  lv_disp_t *disp = NULL;
-
-#if USE_SDL
-  /* Use the 'monitor' driver which creates window on PC's monitor to simulate a display*/
-  sdl_init();
-
-  /*Create a display buffer*/
-  static lv_disp_draw_buf_t disp_buf1;
-  static lv_color_t buf1_1[MONITOR_HOR_RES * 100];
-  static lv_color_t buf1_2[MONITOR_HOR_RES * 100];
-  lv_disp_draw_buf_init(&disp_buf1, buf1_1, buf1_2, MONITOR_HOR_RES * 100);
-
-  /*Create a display*/
-  static lv_disp_drv_t disp_drv;
-  lv_disp_drv_init(&disp_drv); /*Basic initialization*/
-  disp_drv.draw_buf = &disp_buf1;
-  disp_drv.flush_cb = sdl_display_flush;
-  disp_drv.hor_res = MONITOR_HOR_RES;
-  disp_drv.ver_res = MONITOR_VER_RES;
-  disp_drv.antialiasing = 1;
-
-  disp = lv_disp_drv_register(&disp_drv);
-
-  /* Add the input device driver */
-  // mouse_init();
-  indev_drv_1.read_cb = sdl_mouse_read;
-
-  // keyboard_init();
-  indev_drv_2.read_cb = sdl_keyboard_read;
-
-  // mousewheel_init();
-  indev_drv_3.read_cb = sdl_mousewheel_read;
-
-#elif USE_X11
-  lv_x11_init("LVGL Simulator Demo", DISP_HOR_RES, DISP_VER_RES);
-
-  /*Create a display buffer*/
-  static lv_disp_draw_buf_t disp_buf1;
-  static lv_color_t buf1_1[DISP_HOR_RES * 100];
-  static lv_color_t buf1_2[DISP_HOR_RES * 100];
-  lv_disp_draw_buf_init(&disp_buf1, buf1_1, buf1_2, DISP_HOR_RES * 100);
-
-  /*Create a display*/
-  static lv_disp_drv_t disp_drv;
-  lv_disp_drv_init(&disp_drv);
-  disp_drv.draw_buf = &disp_buf1;
-  disp_drv.flush_cb = lv_x11_flush;
-  disp_drv.hor_res = DISP_HOR_RES;
-  disp_drv.ver_res = DISP_VER_RES;
-  disp_drv.antialiasing = 1;
-
-  disp = lv_disp_drv_register(&disp_drv);
-
-  /* Add the input device driver */
-  indev_drv_1.read_cb = lv_x11_get_pointer;
-  indev_drv_2.read_cb = lv_x11_get_keyboard;
-  indev_drv_3.read_cb = lv_x11_get_mousewheel;
-#endif
-  /* Set diplay theme */
-  lv_theme_t * th = lv_theme_default_init(disp, lv_palette_main(LV_PALETTE_BLUE), lv_palette_main(LV_PALETTE_RED), LV_THEME_DEFAULT_DARK, LV_FONT_DEFAULT);
-  lv_disp_set_theme(disp, th);
-
-  /* Tick init */
-  end_tick = false;
-  pthread_create(&thr_tick, NULL, tick_thread, NULL);
-
-  /* register input devices */
-  lv_indev_t *mouse_indev = lv_indev_drv_register(&indev_drv_1);
-  lv_indev_t *kb_indev = lv_indev_drv_register(&indev_drv_2);
-  lv_indev_t *enc_indev = lv_indev_drv_register(&indev_drv_3);
-  lv_indev_set_group(kb_indev, g);
-  lv_indev_set_group(enc_indev, g);
-
-  /* Set a cursor for the mouse */
-  LV_IMG_DECLARE(mouse_cursor_icon);                   /*Declare the image file.*/
-  lv_obj_t * cursor_obj = lv_img_create(lv_scr_act()); /*Create an image object for the cursor*/
-  lv_img_set_src(cursor_obj, &mouse_cursor_icon);      /*Set the image source*/
-  lv_indev_set_cursor(mouse_indev, cursor_obj);        /*Connect the image  object to the driver*/
+    static lv_indev_drv_t mouse_indev_drv;
+    lv_indev_drv_init(&mouse_indev_drv);
+    mouse_indev_drv.type = LV_INDEV_TYPE_POINTER;
+    mouse_indev_drv.read_cb = mouse_read_cb;
+    lv_indev_drv_register(&mouse_indev_drv);
 }
-
-/**
- * Releases the Hardware Abstraction Layer (HAL) for the LVGL graphics library
- */
-static void hal_deinit(void)
+static Uint32 get_mouse_state(SDL_Event *e)
 {
-  end_tick = true;
-  pthread_join(thr_tick, NULL);
-
-#if USE_SDL
-  // nop
-#elif USE_X11
-  lv_x11_deinit();
-#endif
+    //轮询SDL所有窗口事件，关闭窗口，鼠标移动，鼠标左键按下，鼠标左键抬起；
+    while(SDL_PollEvent(e))
+    {
+        if(e->type==SDL_QUIT)
+        {
+            APP_Running = false;
+            return e->type;
+        }
+        //鼠标移动，实时更新x、y坐标
+        if(e->type == SDL_MOUSEMOTION)
+        {
+            mouse_x=(int16_t)e->motion.x;
+            mouse_y=(int16_t)e->motion.y;
+        }
+        if(e->type==SDL_MOUSEBUTTONDOWN&&
+            e->button.button==SDL_BUTTON_LEFT)
+        {
+            mouse_down=true;
+        }
+        if(e->type==SDL_MOUSEBUTTONUP&&
+            e->button.button==SDL_BUTTON_LEFT)
+        {
+            mouse_down=false;
+        }
+    }
+    return 0;   
 }
+//鼠标输入驱动回调，LVGL需要读取鼠标坐标与按键状态
+static void mouse_read_cb(lv_indev_drv_t *indev_drv,
+                        lv_indev_data_t *data)
+{
+    //传递鼠标坐标
+    data->point.x=mouse_x;
+    data->point.y=mouse_y;
+    if(mouse_down)
+    {
+        data->state = LV_INDEV_STATE_PRESSED;
+    }
+    else
+    {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
 
-/**
- * A task to measure the elapsed time for LVGL
- * @param data unused
- * @return never return
- */
-static void* tick_thread(void *data) {
-  (void)data;
-
-  while(!end_tick) {
-    usleep(5000);
-    lv_tick_inc(5); /*Tell LittelvGL that 5 milliseconds were elapsed*/
-  }
-
-  return NULL;
 }
+//按钮点击回调函数
+static void btn_click_event(lv_event_t *e)
+{
+    //获取触发事件，就是按钮
+    lv_obj_t *target = lv_event_get_target(e);
+    const char *txt;
+    //判断事件类型，点击释放
+    if(lv_event_get_code(e)==LV_EVENT_CLICKED)
+    {
+
+        txt=lv_label_get_text(label);
+        if(strcmp(txt,"button click")==0)
+        {
+            //修改顶部文字内容
+            lv_label_set_text(label,"LVGL Test Text OK"); 
+        }    
+        else if(strcmp(txt,"LVGL Test Text OK")==0)
+        {
+            lv_label_set_text(label,"button click");
+        }
+        //lv_refr_now(NULL);
+    }
+}
+//======================================自定义函数===========================================//
